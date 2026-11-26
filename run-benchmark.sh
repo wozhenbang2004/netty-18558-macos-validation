@@ -12,7 +12,7 @@ printf '%s  candidate.patch\n' "$patch_hash" | shasum -a 256 -c
   uname -a
   java -version
   printf 'baseline=%s candidate_sha256=%s\n' "$base" "$patch_hash"
-  printf '4 server loops, 2us/hop, 4 and 20 connections, 5 AB/BA pairs each, warm 4s measure 7s\n'
+  printf '4 server loops, 2us/hop, 4 and 20 connections, six balanced triplets each, warm 4s measure 7s\n'
 } > "$root/results/environment.log" 2>&1
 test "$(uname -m)" = arm64
 git init -q source
@@ -28,40 +28,61 @@ for artifact in jctools-core jctools-core-jdk11; do
   cp="$cp:$jar"
 done
 path=transport/src/main/java/io/netty/channel/nio/NioIoHandler.java
+cat > load-guard.patch <<'LOAD_GUARD_PATCH'
+--- a/transport/src/main/java/io/netty/channel/nio/NioIoHandler.java
++++ b/transport/src/main/java/io/netty/channel/nio/NioIoHandler.java
+@@ -613,7 +613,8 @@
+ 
+     @Override
+     public void wakeup() {
+-        if (!executor.isExecutorThread(Thread.currentThread()) && wakenUp.compareAndSet(false, true)) {
++        if (!executor.isExecutorThread(Thread.currentThread()) && !wakenUp.get()
++                && wakenUp.compareAndSet(false, true)) {
+             selector.wakeup();
+         }
+     }
+LOAD_GUARD_PATCH
+mkdir -p baseline guard candidate benchmark
+javac --release 8 -encoding UTF-8 -cp "$cp" -d baseline "$src/$path"
+git -C source apply --check "$root/load-guard.patch"
+git -C source apply "$root/load-guard.patch"
+javac --release 8 -encoding UTF-8 -cp "$cp" -d guard "$src/$path"
+git -C source apply -R "$root/load-guard.patch"
 git -C source apply --check --include="$path" "$root/candidate.patch"
 git -C source apply --include="$path" "$root/candidate.patch"
-mkdir -p candidate benchmark
 javac --release 8 -encoding UTF-8 -cp "$cp" -d candidate "$src/$path"
 javac --release 21 -encoding UTF-8 -cp "$cp" -d benchmark HealthyNioRoundTrip.java
-run_case() {
-  local conns="$1" pair="$2" kind="$3"
-  local runtime="$root/benchmark:$cp"
-  if [ "$kind" = candidate ]; then runtime="$root/candidate:$runtime"; fi
-  local log="$root/results/$conns-$pair-$kind.log"
-  printf '%s %s %s %s\n' "$(date -u +%FT%TZ)" "$conns" "$pair" "$kind" | tee -a results/order.log
-  java -Xms512m -Xmx512m -cp "$runtime" HealthyNioRoundTrip 4 "$conns" 2000 4 7 > "$log" 2>&1
-  grep -E '^selector=.*KQueueSelectorProvider .*echoed_payloads=verified' "$log"
-}
+shasum -a 256 load-guard.patch candidate.patch HealthyNioRoundTrip.java >> results/environment.log
 for conns in 4 20; do
-  for pair in 1 2 3 4 5; do
-    if (( pair % 2 )); then
-      run_case "$conns" "$pair" baseline
-      run_case "$conns" "$pair" candidate
-    else
-      run_case "$conns" "$pair" candidate
-      run_case "$conns" "$pair" baseline
-    fi
+  round=0
+  for order in 'baseline guard candidate' 'guard candidate baseline' 'candidate baseline guard' 'baseline candidate guard' 'guard baseline candidate' 'candidate guard baseline'; do
+    round=$((round+1))
+    for variant in $order; do
+      printf '%s %s %s %s\n' "$(date -u +%FT%TZ)" "$conns" "$round" "$variant" | tee -a results/order.log
+      log="results/$conns-$round-$variant.log"
+      java -Xms512m -Xmx512m -cp "$root/$variant:$root/benchmark:$cp" HealthyNioRoundTrip 4 "$conns" 2000 4 7 > "$log" 2>&1
+      grep -E '^selector=.*KQueueSelectorProvider .*echoed_payloads=verified' "$log"
+    done
   done
 done
-python3 - <<'PY' | tee results/summary.log
+python3 - results <<'SUMMARIZE_TRIPLETS' | tee results/summary.log
+import re
+import sys
 from pathlib import Path
-from re import search
 from statistics import median
-for connections in (4, 20):
-    for key in ("server_cpu_us_per_request", "requests_s"):
-        def read(pair, variant):
-            s = Path(f"results/{connections}-{pair}-{variant}.log").read_text()
-            return float(search(r"\b" + key + r"=([0-9.]+)", s)[1])
-        deltas = [100 * (read(i, "candidate") / read(i, "baseline") - 1) for i in range(1, 6)]
-        print(f"{connections} connections {key}: median {median(deltas):+.2f}%; all pairs {deltas}")
-PY
+logs = Path(sys.argv[1])
+for conns in (4, 20):
+    for metric in ("server_cpu_us_per_request", "requests_s"):
+        values = {}
+        for variant in ("baseline", "guard", "candidate"):
+            values[variant] = [
+                float(re.search(fr"\b{metric}=([0-9.]+)", (logs / f"{conns}-{i}-{variant}.log").read_text())[1])
+                for i in range(1, 7)
+            ]
+        print(f"{conns} connections, {metric}")
+        for variant, samples in values.items():
+            print(f"  {variant}: median {median(samples):.4f}; samples {samples}")
+        for x, y in (("guard", "baseline"), ("candidate", "baseline"), ("candidate", "guard")):
+            deltas = [(a/b-1)*100 for a,b in zip(values[x],values[y])]
+            print(f"  {x}/{y}: paired median {median(deltas):+.2f}%; pairs {[round(d, 2) for d in deltas]}")
+SUMMARIZE_TRIPLETS
