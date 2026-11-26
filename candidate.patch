@@ -1,0 +1,501 @@
+diff --git a/transport/src/main/java/io/netty/channel/nio/NioIoHandler.java b/transport/src/main/java/io/netty/channel/nio/NioIoHandler.java
+index 7303cc0..0d16706 100644
+--- a/transport/src/main/java/io/netty/channel/nio/NioIoHandler.java
++++ b/transport/src/main/java/io/netty/channel/nio/NioIoHandler.java
+@@ -50,6 +50,7 @@ import java.util.Iterator;
+ import java.util.Set;
+ import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.atomic.AtomicBoolean;
++import java.util.concurrent.atomic.AtomicInteger;
+ 
+ /**
+  * {@link IoHandler} implementation which register the {@link IoHandle}'s to a {@link Selector}.
+@@ -66,6 +67,10 @@ public final class NioIoHandler implements IoHandler {
+     private static final int MIN_PREMATURE_SELECTOR_RETURNS = 3;
+     private static final int SELECTOR_AUTO_REBUILD_THRESHOLD;
+ 
++    private static final int AWAKE = 0;
++    private static final int SELECTING = 1;
++    private static final int WAKEUP_REQUESTED = 2;
++
+     private final IntSupplier selectNowSupplier = new IntSupplier() {
+         @Override
+         public int get() throws Exception {
+@@ -102,13 +107,8 @@ public final class NioIoHandler implements IoHandler {
+ 
+     private final SelectorProvider provider;
+ 
+-    /**
+-     * Boolean that controls determines if a blocked Selector.select should
+-     * break out of its selection process. In our case we use a timeout for
+-     * the select method and the select method will block for that time unless
+-     * waken up.
+-     */
+-    private final AtomicBoolean wakenUp = new AtomicBoolean();
++    // A wakeup does not always come with a queued task (for example, suspension).
++    private final AtomicInteger wakeupState = new AtomicInteger(AWAKE);
+ 
+     private final SelectStrategy selectStrategy;
+     private final ThreadAwareExecutor executor;
+@@ -431,39 +431,7 @@ public final class NioIoHandler implements IoHandler {
+                         // fall-through to SELECT since the busy-wait is not supported with NIO
+ 
+                     case SelectStrategy.SELECT:
+-                        select(context, wakenUp.getAndSet(false));
+-
+-                        // 'wakenUp.compareAndSet(false, true)' is always evaluated
+-                        // before calling 'selector.wakeup()' to reduce the wake-up
+-                        // overhead. (Selector.wakeup() is an expensive operation.)
+-                        //
+-                        // However, there is a race condition in this approach.
+-                        // The race condition is triggered when 'wakenUp' is set to
+-                        // true too early.
+-                        //
+-                        // 'wakenUp' is set to true too early if:
+-                        // 1) Selector is waken up between 'wakenUp.set(false)' and
+-                        //    'selector.select(...)'. (BAD)
+-                        // 2) Selector is waken up between 'selector.select(...)' and
+-                        //    'if (wakenUp.get()) { ... }'. (OK)
+-                        //
+-                        // In the first case, 'wakenUp' is set to true and the
+-                        // following 'selector.select(...)' will wake up immediately.
+-                        // Until 'wakenUp' is set to false again in the next round,
+-                        // 'wakenUp.compareAndSet(false, true)' will fail, and therefore
+-                        // any attempt to wake up the Selector will fail, too, causing
+-                        // the following 'selector.select(...)' call to block
+-                        // unnecessarily.
+-                        //
+-                        // To fix this problem, we wake up the selector again if wakenUp
+-                        // is true immediately after selector.select(...).
+-                        // It is inefficient in that it wakes up the selector for both
+-                        // the first case (BAD - wake-up required) and the second case
+-                        // (OK - no wake-up required).
+-
+-                        if (wakenUp.get()) {
+-                            selector.wakeup();
+-                        }
++                        select(context);
+                         // fall through
+                     default:
+                 }
+@@ -613,7 +581,8 @@ public final class NioIoHandler implements IoHandler {
+ 
+     @Override
+     public void wakeup() {
+-        if (!executor.isExecutorThread(Thread.currentThread()) && wakenUp.compareAndSet(false, true)) {
++        if (!executor.isExecutorThread(Thread.currentThread()) && wakeupState.get() != WAKEUP_REQUESTED
++                && wakeupState.getAndSet(WAKEUP_REQUESTED) == SELECTING) {
+             selector.wakeup();
+         }
+     }
+@@ -627,7 +596,13 @@ public final class NioIoHandler implements IoHandler {
+         return unwrappedSelector;
+     }
+ 
+-    private void select(IoHandlerContext runner, boolean oldWakenUp) throws IOException {
++    private void select(IoHandlerContext runner) throws IOException {
++        // A wakeup received while awake is remembered without touching the selector.
++        if (!wakeupState.compareAndSet(AWAKE, SELECTING)) {
++            selectNow();
++            return;
++        }
++
+         Selector selector = this.selector;
+         try {
+             int selectCnt = 0;
+@@ -655,11 +630,8 @@ public final class NioIoHandler implements IoHandler {
+                     // in NIO this means to block without any deadline
+                     timeoutMillis = 0;
+                 }
+-                // If a task was submitted when wakenUp value was true, the task didn't get a chance to call
+-                // Selector#wakeup. So we need to check task queue again before executing select operation.
+-                // If we don't, the task might be pended until select operation was timed out.
+-                // It might be pended until idle timeout if IdleStateHandler existed in pipeline.
+-                if (!runner.canBlock() && wakenUp.compareAndSet(false, true)) {
++                // Recheck the queue after publishing SELECTING. A later submission can wake the selector.
++                if (!runner.canBlock() || wakeupState.get() == WAKEUP_REQUESTED) {
+                     selector.selectNow();
+                     selectCnt = 1;
+                     break;
+@@ -668,7 +640,7 @@ public final class NioIoHandler implements IoHandler {
+                 int selectedKeys = selector.select(timeoutMillis);
+                 selectCnt ++;
+ 
+-                if (selectedKeys != 0 || oldWakenUp || wakenUp.get() || !runner.canBlock()) {
++                if (selectedKeys != 0 || wakeupState.get() == WAKEUP_REQUESTED || !runner.canBlock()) {
+                     // - Selected something,
+                     // - waken up by user, or
+                     // - the task queue has a pending task.
+@@ -718,6 +690,8 @@ public final class NioIoHandler implements IoHandler {
+                         selector, e);
+             }
+             // Harmless exception - log anyway
++        } finally {
++            wakeupState.lazySet(AWAKE);
+         }
+     }
+ 
+@@ -741,14 +715,9 @@ public final class NioIoHandler implements IoHandler {
+     }
+ 
+     int selectNow() throws IOException {
+-        try {
+-            return selector.selectNow();
+-        } finally {
+-            // restore wakeup state if needed
+-            if (wakenUp.get()) {
+-                selector.wakeup();
+-            }
+-        }
++        // This poll makes progress on requests already received; a later wakeup remains pending.
++        wakeupState.lazySet(AWAKE);
++        return selector.selectNow();
+     }
+ 
+     private Selector selectRebuildSelector(int selectCnt) throws IOException {
+diff --git a/transport/src/test/java/io/netty/channel/nio/NioIoHandlerTest.java b/transport/src/test/java/io/netty/channel/nio/NioIoHandlerTest.java
+index 8c4bd17..bc330c7 100644
+--- a/transport/src/test/java/io/netty/channel/nio/NioIoHandlerTest.java
++++ b/transport/src/test/java/io/netty/channel/nio/NioIoHandlerTest.java
+@@ -15,27 +15,39 @@
+  */
+ package io.netty.channel.nio;
+ 
+-import io.netty.channel.IoHandlerContext;
+ import io.netty.channel.IoHandler;
++import io.netty.channel.IoHandlerContext;
+ import io.netty.channel.IoHandlerFactory;
+ import io.netty.channel.IoRegistration;
+ import io.netty.util.NetUtil;
+ import io.netty.util.concurrent.ThreadAwareExecutor;
+ import org.junit.jupiter.api.Test;
++import org.junit.jupiter.params.ParameterizedTest;
++import org.junit.jupiter.params.provider.ValueSource;
+ 
+ import java.io.IOException;
+ import java.net.InetSocketAddress;
+ import java.net.Socket;
+ import java.nio.channels.SelectionKey;
++import java.nio.channels.Selector;
+ import java.nio.channels.ServerSocketChannel;
++import java.nio.channels.spi.AbstractSelectableChannel;
++import java.nio.channels.spi.AbstractSelector;
+ import java.nio.channels.spi.SelectorProvider;
++import java.util.Collections;
+ import java.util.Queue;
++import java.util.Set;
++import java.util.concurrent.CompletableFuture;
+ import java.util.concurrent.ConcurrentLinkedQueue;
+ import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.atomic.AtomicBoolean;
++import java.util.concurrent.atomic.AtomicInteger;
+ 
++import static org.assertj.core.api.Assertions.assertThat;
+ import static org.junit.jupiter.api.Assertions.assertEquals;
+ import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.when;
+ 
+ public class NioIoHandlerTest {
+ 
+@@ -136,6 +148,169 @@ public class NioIoHandlerTest {
+         handler.destroy();
+     }
+ 
++    @ParameterizedTest
++    @ValueSource(booleans = {true, false})
++    void testWakeupWhileAwakeIsRememberedWithoutWakingSelector(boolean canBlock) throws Exception {
++        CountingSelector selector = new CountingSelector();
++        IoHandler handler = newHandler(selector);
++        try {
++            runFromAnotherThread(handler::wakeup);
++            handler.run(context(canBlock));
++
++            assertThat(selector.polls).isEqualTo(1);
++            assertThat(selector.selects).isZero();
++            assertThat(selector.wakeups.get()).isZero();
++
++            // The pending wakeup was consumed, so the next iteration can block again.
++            handler.run(context(true));
++            assertThat(selector.selects).isEqualTo(1);
++        } finally {
++            handler.destroy();
++        }
++    }
++
++    @Test
++    void testWakeupDuringSelectionIsCoalesced() throws Exception {
++        CountingSelector selector = new CountingSelector();
++        IoHandler handler = newHandler(selector);
++        selector.onSelect = () -> runFromAnotherThread(() -> {
++            handler.wakeup();
++            handler.wakeup();
++        });
++        try {
++            handler.run(context(true));
++
++            assertThat(selector.selects).isEqualTo(1);
++            assertThat(selector.wakeups.get()).isEqualTo(1);
++        } finally {
++            handler.destroy();
++        }
++    }
++
++    @Test
++    void testWakeupRemainsPendingWhenSelectorIsRebuilt() throws Exception {
++        CountingSelector oldSelector = new CountingSelector();
++        CountingSelector newSelector = new CountingSelector();
++        NioIoHandler handler = newHandler(oldSelector, newSelector);
++        try {
++            runFromAnotherThread(handler::wakeup);
++            handler.rebuildSelector0();
++            handler.run(context(true));
++
++            assertThat(oldSelector.isOpen()).isFalse();
++            assertThat(oldSelector.wakeups.get()).isZero();
++            assertThat(newSelector.polls).isEqualTo(1);
++            assertThat(newSelector.wakeups.get()).isZero();
++            assertThat(newSelector.selects).isZero();
++
++            handler.run(context(true));
++            assertThat(newSelector.selects).isEqualTo(1);
++        } finally {
++            handler.destroy();
++        }
++    }
++
++    private static NioIoHandler newHandler(AbstractSelector selector, AbstractSelector... replacements)
++            throws IOException {
++        // Use a deterministic selector without implementing unrelated provider methods.
++        SelectorProvider provider = mock(SelectorProvider.class);
++        when(provider.openSelector()).thenReturn(selector, replacements);
++        Thread owner = Thread.currentThread();
++        ThreadAwareExecutor executor = new ThreadAwareExecutor() {
++            @Override
++            public boolean isExecutorThread(Thread thread) {
++                return thread == owner;
++            }
++
++            @Override
++            public void execute(Runnable command) {
++                throw new UnsupportedOperationException();
++            }
++        };
++        return (NioIoHandler) NioIoHandler.newFactory(provider).newHandler(executor);
++    }
++
++    private static IoHandlerContext context(boolean canBlock) {
++        return new IoHandlerContext() {
++            @Override
++            public boolean canBlock() {
++                return canBlock;
++            }
++
++            @Override
++            public long delayNanos(long currentTimeNanos) {
++                return Long.MAX_VALUE;
++            }
++
++            @Override
++            public long deadlineNanos() {
++                return -1;
++            }
++        };
++    }
++
++    private static void runFromAnotherThread(Runnable task) {
++        assertThat(CompletableFuture.runAsync(task)).succeedsWithin(5, TimeUnit.SECONDS);
++    }
++
++    private static final class CountingSelector extends AbstractSelector {
++        private final AtomicInteger wakeups = new AtomicInteger();
++        private int polls;
++        private int selects;
++        private Runnable onSelect;
++
++        CountingSelector() {
++            super(SelectorProvider.provider());
++        }
++
++        @Override
++        public Set<SelectionKey> keys() {
++            return Collections.emptySet();
++        }
++
++        @Override
++        public Set<SelectionKey> selectedKeys() {
++            return Collections.emptySet();
++        }
++
++        @Override
++        public int selectNow() {
++            ++polls;
++            return 0;
++        }
++
++        @Override
++        public int select(long timeout) {
++            ++selects;
++            if (onSelect != null) {
++                onSelect.run();
++                return 0;
++            }
++            return 1;
++        }
++
++        @Override
++        public int select() {
++            return select(0);
++        }
++
++        @Override
++        public Selector wakeup() {
++            wakeups.incrementAndGet();
++            return this;
++        }
++
++        @Override
++        protected SelectionKey register(AbstractSelectableChannel channel, int ops, Object attachment) {
++            throw new UnsupportedOperationException();
++        }
++
++        @Override
++        protected void implCloseSelector() {
++            // No channels are registered.
++        }
++    }
++
+     @Test
+     void testMillisBeforeDeadlineRoundsUp() {
+         long now = 1_000_000_000L;
+diff --git a/microbench/src/main/java/io/netty/microbench/channel/NioCrossEventLoopBenchmark.java b/microbench/src/main/java/io/netty/microbench/channel/NioCrossEventLoopBenchmark.java
+new file mode 100644
+index 0000000..9af080c
+--- /dev/null
++++ b/microbench/src/main/java/io/netty/microbench/channel/NioCrossEventLoopBenchmark.java
+@@ -0,0 +1,125 @@
++/*
++ * Copyright 2026 The Netty Project
++ *
++ * The Netty Project licenses this file to you under the Apache License,
++ * version 2.0 (the "License"); you may not use this file except in compliance
++ * with the License. You may obtain a copy of the License at:
++ *
++ *   https://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++ * License for the specific language governing permissions and limitations
++ * under the License.
++ */
++package io.netty.microbench.channel;
++
++import io.netty.bootstrap.ServerBootstrap;
++import io.netty.buffer.ByteBuf;
++import io.netty.channel.Channel;
++import io.netty.channel.ChannelHandlerContext;
++import io.netty.channel.ChannelInitializer;
++import io.netty.channel.ChannelOption;
++import io.netty.channel.EventLoop;
++import io.netty.channel.MultiThreadIoEventLoopGroup;
++import io.netty.channel.SimpleChannelInboundHandler;
++import io.netty.channel.nio.NioIoHandler;
++import io.netty.channel.socket.SocketChannel;
++import io.netty.channel.socket.nio.NioServerSocketChannel;
++import io.netty.handler.codec.FixedLengthFrameDecoder;
++import io.netty.microbench.util.AbstractMicrobenchmark;
++import io.netty.util.NetUtil;
++import org.openjdk.jmh.annotations.Benchmark;
++import org.openjdk.jmh.annotations.Scope;
++import org.openjdk.jmh.annotations.Setup;
++import org.openjdk.jmh.annotations.State;
++import org.openjdk.jmh.annotations.TearDown;
++import org.openjdk.jmh.annotations.Threads;
++
++import java.io.BufferedInputStream;
++import java.io.DataInputStream;
++import java.io.DataOutputStream;
++import java.io.IOException;
++import java.net.InetSocketAddress;
++import java.net.Socket;
++import java.util.concurrent.TimeUnit;
++
++public class NioCrossEventLoopBenchmark extends AbstractMicrobenchmark {
++    @State(Scope.Benchmark)
++    public static class Server {
++        private MultiThreadIoEventLoopGroup group;
++        private Channel listener;
++
++        @Setup
++        public void setup() throws InterruptedException {
++            group = new MultiThreadIoEventLoopGroup(2, NioIoHandler.newFactory());
++            EventLoop first = group.next();
++            EventLoop second = group.next();
++            listener = new ServerBootstrap().group(group).channel(NioServerSocketChannel.class)
++                    .childOption(ChannelOption.TCP_NODELAY, true)
++                    .childHandler(new ChannelInitializer<SocketChannel>() {
++                        @Override
++                        protected void initChannel(SocketChannel channel) {
++                            EventLoop owner = channel.eventLoop();
++                            EventLoop other = owner == first ? second : first;
++                            channel.pipeline().addLast(new FixedLengthFrameDecoder(Long.BYTES));
++                            channel.pipeline().addLast(new SimpleChannelInboundHandler<ByteBuf>() {
++                                @Override
++                                protected void channelRead0(ChannelHandlerContext ctx, ByteBuf message) {
++                                    long value = message.readLong();
++                                    other.execute(() -> owner.execute(() ->
++                                            ctx.writeAndFlush(ctx.alloc().buffer(Long.BYTES).writeLong(value))));
++                                }
++                            });
++                        }
++                    }).bind(new InetSocketAddress(NetUtil.LOCALHOST, 0)).sync().channel();
++        }
++
++        @TearDown
++        public void tearDown() throws InterruptedException {
++            try {
++                if (listener != null) {
++                    listener.close().sync();
++                }
++            } finally {
++                group.shutdownGracefully(0, 5, TimeUnit.SECONDS).sync();
++            }
++        }
++    }
++
++    @State(Scope.Thread)
++    public static class Client {
++        private Socket socket;
++        private DataInputStream input;
++        private DataOutputStream output;
++        private long sequence;
++
++        @Setup
++        public void setup(Server server) throws IOException {
++            socket = new Socket();
++            socket.setTcpNoDelay(true);
++            socket.setSoTimeout(10000);
++            socket.connect(server.listener.localAddress());
++            input = new DataInputStream(new BufferedInputStream(socket.getInputStream()));
++            output = new DataOutputStream(socket.getOutputStream());
++        }
++
++        @TearDown
++        public void tearDown() throws IOException {
++            socket.close();
++        }
++    }
++
++    @Benchmark
++    @Threads(4)
++    public long roundTrip(Client client) throws IOException {
++        long expected = ++client.sequence;
++        client.output.writeLong(expected);
++        long received = client.input.readLong();
++        if (received != expected) {
++            throw new IllegalStateException("Unexpected response: " + received + ", expected " + expected);
++        }
++        return received;
++    }
++}
