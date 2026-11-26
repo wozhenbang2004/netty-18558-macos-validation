@@ -1,0 +1,29 @@
+name: Netty macOS ARM64 comparison
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [.github/workflows/macos-benchmark.yml]
+permissions:
+  contents: read
+jobs:
+  benchmark:
+    runs-on: macos-26
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25.0.3"
+      - name: Validate and compare on JDK NIO
+        run: bash run-benchmark.sh
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-arm64-netty-results
+          path: results/
+          retention-days: 7
